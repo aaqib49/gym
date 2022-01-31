@@ -1,20 +1,13 @@
-from __future__ import annotations
-
-from abc import abstractmethod
-from typing import TypeVar, Generic, Tuple
-from typing import Optional
-
 import gym
-from gym import error, spaces
+from gym import error
+from gym.utils import closer
 
-from gym.utils import closer, seeding
-from gym.logger import deprecation
+from imagecorruptions import corrupt
 
-ObsType = TypeVar("ObsType")
-ActType = TypeVar("ActType")
+env_closer = closer.Closer()
 
 
-class Env(Generic[ObsType, ActType]):
+class Env(object):
     """The main OpenAI Gym class. It encapsulates an environment with
     arbitrary behind-the-scenes dynamics. An environment can be
     partially or fully observed.
@@ -37,21 +30,16 @@ class Env(Generic[ObsType, ActType]):
 
     The methods are accessed publicly as "step", "reset", etc...
     """
-
     # Set this in SOME subclasses
-    metadata = {"render.modes": []}
-    reward_range = (-float("inf"), float("inf"))
+    metadata = {'render.modes': []}
+    reward_range = (-float('inf'), float('inf'))
     spec = None
 
     # Set these in ALL subclasses
-    action_space: spaces.Space[ActType]
-    observation_space: spaces.Space[ObsType]
+    action_space = None
+    observation_space = None
 
-    # Created
-    np_random = None
-
-    @abstractmethod
-    def step(self, action: ActType) -> Tuple[ObsType, float, bool, dict]:
+    def step(self, action):
         """Run one timestep of the environment's dynamics. When end of
         episode is reached, you are responsible for calling `reset()`
         to reset this environment's state.
@@ -69,10 +57,7 @@ class Env(Generic[ObsType, ActType]):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def reset(
-        self, *, seed: Optional[int] = None, options: Optional[dict] = None
-    ) -> ObsType:
+    def reset(self):
         """Resets the environment to an initial state and returns an initial
         observation.
 
@@ -85,12 +70,9 @@ class Env(Generic[ObsType, ActType]):
         Returns:
             observation (object): the initial observation.
         """
-        # Initialize the RNG if it's the first reset, or if the seed is manually passed
-        if seed is not None or self.np_random is None:
-            self.np_random, seed = seeding.np_random(seed)
+        raise NotImplementedError
 
-    @abstractmethod
-    def render(self, mode="human"):
+    def render(self, mode='human'):
         """Renders the environment.
 
         The set of supported modes varies per environment. (And some
@@ -152,15 +134,10 @@ class Env(Generic[ObsType, ActType]):
               'seed'. Often, the main seed equals the provided 'seed', but
               this won't be true if seed=None, for example.
         """
-        deprecation(
-            "Function `env.seed(seed)` is marked as deprecated and will be removed in the future. "
-            "Please use `env.reset(seed=seed) instead."
-        )
-        self.np_random, seed = seeding.np_random(seed)
-        return [seed]
+        return
 
     @property
-    def unwrapped(self) -> Env:
+    def unwrapped(self):
         """Completely unwrap this env.
 
         Returns:
@@ -170,19 +147,57 @@ class Env(Generic[ObsType, ActType]):
 
     def __str__(self):
         if self.spec is None:
-            return f"<{type(self).__name__} instance>"
+            return '<{} instance>'.format(type(self).__name__)
         else:
-            return f"<{type(self).__name__}<{self.spec.id}>>"
+            return '<{}<{}>>'.format(type(self).__name__, self.spec.id)
 
     def __enter__(self):
-        """Support with-statement for the environment."""
+        """Support with-statement for the environment. """
         return self
 
     def __exit__(self, *args):
-        """Support with-statement for the environment."""
+        """Support with-statement for the environment. """
         self.close()
         # propagate exception
         return False
+
+
+class GoalEnv(Env):
+    """A goal-based environment. It functions just as any regular OpenAI Gym environment but it
+    imposes a required structure on the observation_space. More concretely, the observation
+    space is required to contain at least three elements, namely `observation`, `desired_goal`, and
+    `achieved_goal`. Here, `desired_goal` specifies the goal that the agent should attempt to achieve.
+    `achieved_goal` is the goal that it currently achieved instead. `observation` contains the
+    actual observations of the environment as per usual.
+    """
+
+    def reset(self):
+        # Enforce that each GoalEnv uses a Goal-compatible observation space.
+        if not isinstance(self.observation_space, gym.spaces.Dict):
+            raise error.Error('GoalEnv requires an observation space of type gym.spaces.Dict')
+        for key in ['observation', 'achieved_goal', 'desired_goal']:
+            if key not in self.observation_space.spaces:
+                raise error.Error('GoalEnv requires the "{}" key to be part of the observation dictionary.'.format(key))
+
+    def compute_reward(self, achieved_goal, desired_goal, info):
+        """Compute the step reward. This externalizes the reward function and makes
+        it dependent on a desired goal and the one that was achieved. If you wish to include
+        additional rewards that are independent of the goal, you can include the necessary values
+        to derive it in 'info' and compute it accordingly.
+
+        Args:
+            achieved_goal (object): the goal that was achieved during execution
+            desired_goal (object): the desired goal that we asked the agent to attempt to achieve
+            info (dict): an info dictionary with additional information
+
+        Returns:
+            float: The reward that corresponds to the provided achieved goal w.r.t. to the desired
+            goal. Note that the following should always hold true:
+
+                ob, reward, done, info = env.step()
+                assert reward == env.compute_reward(ob['achieved_goal'], ob['goal'], info)
+        """
+        raise NotImplementedError
 
 
 class Wrapper(Env):
@@ -197,18 +212,16 @@ class Wrapper(Env):
         Don't forget to call ``super().__init__(env)`` if the subclass overrides :meth:`__init__`.
 
     """
-
     def __init__(self, env):
         self.env = env
-
-        self._action_space = None
-        self._observation_space = None
-        self._reward_range = None
-        self._metadata = None
+        self.action_space = self.env.action_space
+        self.observation_space = self.env.observation_space
+        self.reward_range = self.env.reward_range
+        self.metadata = self.env.metadata
 
     def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(f"attempted to get missing private attribute '{name}'")
+        if name.startswith('_'):
+            raise AttributeError("attempted to get missing private attribute '{}'".format(name))
         return getattr(self.env, name)
 
     @property
@@ -219,53 +232,13 @@ class Wrapper(Env):
     def class_name(cls):
         return cls.__name__
 
-    @property
-    def action_space(self):
-        if self._action_space is None:
-            return self.env.action_space
-        return self._action_space
-
-    @action_space.setter
-    def action_space(self, space):
-        self._action_space = space
-
-    @property
-    def observation_space(self):
-        if self._observation_space is None:
-            return self.env.observation_space
-        return self._observation_space
-
-    @observation_space.setter
-    def observation_space(self, space):
-        self._observation_space = space
-
-    @property
-    def reward_range(self):
-        if self._reward_range is None:
-            return self.env.reward_range
-        return self._reward_range
-
-    @reward_range.setter
-    def reward_range(self, value):
-        self._reward_range = value
-
-    @property
-    def metadata(self):
-        if self._metadata is None:
-            return self.env.metadata
-        return self._metadata
-
-    @metadata.setter
-    def metadata(self, value):
-        self._metadata = value
-
     def step(self, action):
         return self.env.step(action)
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
-    def render(self, mode="human", **kwargs):
+    def render(self, mode='human', **kwargs):
         return self.env.render(mode, **kwargs)
 
     def close(self):
@@ -278,7 +251,7 @@ class Wrapper(Env):
         return self.env.compute_reward(achieved_goal, desired_goal, info)
 
     def __str__(self):
-        return f"<{type(self).__name__}{self.env}>"
+        return '<{}{}>'.format(type(self).__name__, self.env)
 
     def __repr__(self):
         return str(self)
@@ -289,6 +262,12 @@ class Wrapper(Env):
 
 
 class ObservationWrapper(Wrapper):
+
+    def __init__(self, env, corruption_name=None, severity=None):
+        super().__init__(env)
+        self.corruption_name = corruption_name
+        self.severity = severity
+
     def reset(self, **kwargs):
         observation = self.env.reset(**kwargs)
         return self.observation(observation)
@@ -297,9 +276,13 @@ class ObservationWrapper(Wrapper):
         observation, reward, done, info = self.env.step(action)
         return self.observation(observation), reward, done, info
 
-    @abstractmethod
+    # def observation_original(self, observation):
+    #     raise NotImplementedError
+
     def observation(self, observation):
-        raise NotImplementedError
+        if (self.corruption_name is not None) and (self.severity is not None):
+            observation = corrupt(observation, corruption_name=self.corruption_name, severity=self.severity)
+        return observation
 
 
 class RewardWrapper(Wrapper):
@@ -310,7 +293,6 @@ class RewardWrapper(Wrapper):
         observation, reward, done, info = self.env.step(action)
         return observation, self.reward(reward), done, info
 
-    @abstractmethod
     def reward(self, reward):
         raise NotImplementedError
 
@@ -322,10 +304,9 @@ class ActionWrapper(Wrapper):
     def step(self, action):
         return self.env.step(self.action(action))
 
-    @abstractmethod
     def action(self, action):
         raise NotImplementedError
 
-    @abstractmethod
     def reverse_action(self, action):
         raise NotImplementedError
+ 
